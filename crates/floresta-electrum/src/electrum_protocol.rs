@@ -383,7 +383,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 let hash = get_spk_hash(&script);
 
                 if !self.address_cache.is_address_cached(&hash) {
-                    self.address_cache.cache_address(script.clone());
+                    self.address_cache
+                        .cache_address(script.clone())
+                        .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
                     self.addresses_to_scan.push(script);
                     let res = json!({
                         "confirmed": 0,
@@ -404,7 +406,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 let hash = get_spk_hash(&script);
 
                 if !self.address_cache.is_address_cached(&hash) {
-                    self.address_cache.cache_address(script.clone());
+                    self.address_cache
+                        .cache_address(script.clone())
+                        .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
                     self.addresses_to_scan.push(script);
                     return json_rpc_res!(request, null);
                 }
@@ -468,12 +472,16 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     return Err(super::error::Error::Mempool(Box::new(e)));
                 };
 
-                let updated = self
-                    .address_cache
-                    .cache_mempool_transaction(&tx)
-                    .into_iter()
-                    .map(|spend| (tx.clone(), spend))
-                    .collect::<Vec<_>>();
+                let updated = match self.address_cache.cache_mempool_transaction(&tx) {
+                    Ok(coins) => coins
+                        .into_iter()
+                        .map(|spend| (tx.clone(), spend))
+                        .collect::<Vec<_>>(),
+                    Err(e) => {
+                        error!("Error caching mempool transaction: {e}");
+                        vec![]
+                    }
+                };
 
                 self.wallet_notify(&updated);
                 json_rpc_res!(request, txid)
@@ -595,7 +603,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 }
 
                 self.addresses_to_scan.iter().for_each(|address| {
-                    self.address_cache.cache_address(address.clone());
+                    if let Err(e) = self.address_cache.cache_address(address.clone()) {
+                        error!("Could not cache address: {e}");
+                    }
                 });
 
                 info!("Catching up with addresses {:?}", self.addresses_to_scan);
@@ -702,10 +712,12 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }]
         });
 
-        let current_height = self.address_cache.get_cache_height();
+        let current_height = self.address_cache.get_cache_height().unwrap_or(0);
 
         if (!self.chain.is_in_ibd() || height % 1000 == 0) && (height > current_height) {
-            self.address_cache.bump_height(height);
+            if let Err(e) = self.address_cache.bump_height(height) {
+                error!("Could not update cache height: {e}");
+            }
         }
 
         if self.chain.get_height().unwrap() == height {
@@ -717,7 +729,13 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
         }
 
-        let transactions = self.address_cache.block_process(&block, height);
+        let transactions = match self.address_cache.block_process(&block, height) {
+            Ok(txs) => txs,
+            Err(e) => {
+                error!("Error processing block at height {height}: {e}");
+                vec![]
+            }
+        };
 
         self.wallet_notify(&transactions);
     }
@@ -1022,20 +1040,22 @@ mod test {
     fn get_test_cache() -> Arc<AddressCache<KvDatabase>> {
         let test_id: u32 = rand::random();
         let cache = KvDatabase::new(format!("./tmp-db/{test_id}.floresta")).unwrap();
-        let cache = AddressCache::new(cache);
+        let cache = AddressCache::new(cache).unwrap();
 
         // Inserting test transactions in the wallet
         let (transaction, proof) = get_test_transaction();
-        cache.cache_transaction(
-            &transaction,
-            118511,
-            transaction.output[0].value.to_sat(),
-            proof,
-            1,
-            0,
-            false,
-            get_spk_hash(&transaction.output[0].script_pubkey),
-        );
+        cache
+            .cache_transaction(
+                &transaction,
+                118511,
+                transaction.output[0].value.to_sat(),
+                proof,
+                1,
+                0,
+                false,
+                get_spk_hash(&transaction.output[0].script_pubkey),
+            )
+            .unwrap();
 
         Arc::new(cache)
     }

@@ -23,6 +23,7 @@ use miniscript::descriptor::checksum;
 use serde_json::json;
 use serde_json::Value;
 use tracing::debug;
+use tracing::error;
 
 use super::res::GetBlockchainInfoRes;
 use super::res::GetTxOutProof;
@@ -613,7 +614,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             return Err(JsonRpcError::NoBlockFilters);
         };
 
-        self.wallet.cache_address(script.clone());
+        if let Err(e) = self.wallet.cache_address(script.clone()) {
+            error!("Could not cache address: {e}");
+        }
         let filter_key = script.to_bytes();
         let candidates = cfilters
             .match_any(
@@ -642,7 +645,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 return Err(JsonRpcError::BlockNotFound);
             };
 
-            self.wallet.block_process(&candidate, height);
+            if let Err(e) = self.wallet.block_process(&candidate, height) {
+                error!("Error processing block at height {height}: {e}");
+            }
         }
 
         let val = match self.get_tx_out(txid, vout, false)? {

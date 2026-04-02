@@ -115,7 +115,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                     .at_derivation_index(index)
                     .unwrap()
                     .script_pubkey();
-                self.wallet.cache_address(address.clone());
+                if let Err(e) = self.wallet.cache_address(address.clone()) {
+                    error!("Could not cache address: {e}");
+                }
                 address
             })
             .collect::<Vec<_>>();
@@ -608,7 +610,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                     .unwrap()
                     .unwrap();
 
-                wallet.block_process(&block, height);
+                if let Err(e) = wallet.block_process(&block, height) {
+                    error!("Error processing block at height {height}: {e}");
+                }
             }
         }
 

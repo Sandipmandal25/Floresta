@@ -48,6 +48,9 @@ use tracing::error;
 pub enum WatchOnlyError<DatabaseError: Debug> {
     WalletNotInitialized,
     TransactionNotFound,
+    CachedAddressNotFound,
+    IndexOutOfBounds,
+    PoisonedLock,
     DatabaseError(DatabaseError),
 }
 
@@ -59,6 +62,15 @@ impl<DatabaseError: Debug> Display for WatchOnlyError<DatabaseError> {
             }
             WatchOnlyError::TransactionNotFound => {
                 write!(f, "Transaction not found")
+            }
+            WatchOnlyError::CachedAddressNotFound => {
+                write!(f, "Cached address not found in address map")
+            }
+            WatchOnlyError::IndexOutOfBounds => {
+                write!(f, "Index out of bounds")
+            }
+            WatchOnlyError::PoisonedLock => {
+                write!(f, "Poisoned lock")
             }
             WatchOnlyError::DatabaseError(e) => {
                 write!(f, "Database error: {e:?}")
@@ -109,7 +121,8 @@ impl Default for CachedTransaction {
         CachedTransaction {
             // A placeholder transaction with no input and no outputs, the bare-minimum to be
             // serializable
-            tx: deserialize(&Vec::from_hex("010000000000ffffffff").unwrap()).unwrap(),
+            tx: deserialize(&Vec::from_hex("010000000000ffffffff").expect("hardcoded valid hex"))
+                .expect("hardcoded valid transaction bytes"),
             height: 0,
             merkle_block: None,
             hash: Txid::all_zeros(),
@@ -146,7 +159,7 @@ pub trait AddressCacheDatabase {
     type Error: Debug + Send + Sync + 'static;
     /// Saves a new address to the database. If the address already exists, `update` should
     /// be used instead
-    fn save(&self, address: &CachedAddress);
+    fn save(&self, address: &CachedAddress) -> Result<(), Self::Error>;
     /// Loads all addresses we have cached so far
     fn load(&self) -> Result<Vec<CachedAddress>, Self::Error>;
     /// Loads the data associated with our watch-only wallet.
@@ -154,7 +167,7 @@ pub trait AddressCacheDatabase {
     /// Saves the data associated with our watch-only wallet.
     fn save_stats(&self, stats: &Stats) -> Result<(), Self::Error>;
     /// Updates an address, probably because a new transaction arrived
-    fn update(&self, address: &CachedAddress);
+    fn update(&self, address: &CachedAddress) -> Result<(), Self::Error>;
     /// TODO: Maybe turn this into another db
     /// Returns the height of the last block we filtered
     fn get_cache_height(&self) -> Result<u32, Self::Error>;
@@ -188,7 +201,11 @@ struct AddressCacheInner<D: AddressCacheDatabase> {
 impl<D: AddressCacheDatabase> AddressCacheInner<D> {
     /// Iterates through a block, finds transactions destined to ourselves.
     /// Returns all transactions we found.
-    fn block_process(&mut self, block: &Block, height: u32) -> Vec<(Transaction, TxOut)> {
+    fn block_process(
+        &mut self,
+        block: &Block,
+        height: u32,
+    ) -> Result<Vec<(Transaction, TxOut)>, WatchOnlyError<D::Error>> {
         let mut my_transactions = Vec::new();
         // Check if this transaction spends from one of our utxos
         for (position, transaction) in block.txdata.iter().enumerate() {
@@ -197,17 +214,17 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     let script = self
                         .address_map
                         .get(script)
-                        .expect("Can't cache a utxo for a address we don't have")
+                        .ok_or(WatchOnlyError::CachedAddressNotFound)?
                         .to_owned();
                     let tx = self
                         .get_transaction(&txin.previous_output.txid)
-                        .expect("We cached a utxo for a transaction we don't have");
+                        .ok_or(WatchOnlyError::TransactionNotFound)?;
 
                     let utxo = tx
                         .tx
                         .output
                         .get(txin.previous_output.vout as usize)
-                        .expect("Did we cache an invalid utxo?");
+                        .ok_or(WatchOnlyError::IndexOutOfBounds)?;
 
                     let merkle_block = MerkleProof::from_block(block, position as u64);
 
@@ -220,7 +237,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                         vin,
                         true,
                         script.script_hash,
-                    )
+                    )?;
                 }
             }
             // Checks if one of our addresses is the recipient of this transaction
@@ -240,19 +257,17 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                         vout,
                         false,
                         hash,
-                    );
+                    )?;
                 }
             }
         }
-        my_transactions
+        Ok(my_transactions)
     }
 
-    fn new(database: D) -> AddressCacheInner<D> {
-        let scripts = database.load().expect("Could not load database");
+    fn new(database: D) -> Result<AddressCacheInner<D>, WatchOnlyError<D::Error>> {
+        let scripts = database.load()?;
         if database.get_stats().is_err() {
-            database
-                .save_stats(&Stats::default())
-                .expect("Could not save stats");
+            database.save_stats(&Stats::default())?;
         }
         let mut address_map = HashMap::new();
         let mut script_set = HashSet::new();
@@ -265,12 +280,12 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             address_map.insert(address.script_hash, address);
         }
 
-        AddressCacheInner {
+        Ok(AddressCacheInner {
             database,
             address_map,
             script_set,
             utxo_index,
-        }
+        })
     }
 
     fn get_address_utxos(&self, script_hash: &Hash) -> Option<Vec<(TxOut, OutPoint)>> {
@@ -320,10 +335,10 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
 
     /// Adds a new address to track, should be called at wallet setup and every once in a while
     /// to cache new addresses, as we use the first ones. Only requires a script to cache.
-    fn cache_address(&mut self, script_pk: ScriptBuf) {
+    fn cache_address(&mut self, script_pk: ScriptBuf) -> Result<(), WatchOnlyError<D::Error>> {
         let hash = get_spk_hash(&script_pk);
         if self.address_map.contains_key(&hash) {
-            return;
+            return Ok(());
         }
         let new_address = CachedAddress {
             balance: 0,
@@ -332,10 +347,11 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             transactions: Vec::new(),
             utxos: Vec::new(),
         };
-        self.database.save(&new_address);
+        self.database.save(&new_address)?;
 
         self.address_map.insert(hash, new_address);
         self.script_set.insert(hash);
+        Ok(())
     }
 
     /// Setup is the first command that should be executed. In a new cache. It sets our wallet's
@@ -358,21 +374,19 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     .at_derivation_index(idx)
                     .expect("We validate those descriptors before saving")
                     .script_pubkey();
-                self.cache_address(script);
+                self.cache_address(script)?;
             }
         }
         stats.derivation_index += 100;
         Ok(self.database.save_stats(&stats)?)
     }
 
-    fn maybe_derive_addresses(&mut self) {
-        let stats = self.database.get_stats().unwrap();
+    fn maybe_derive_addresses(&mut self) -> Result<(), WatchOnlyError<D::Error>> {
+        let stats = self.database.get_stats()?;
         if stats.transaction_count > (stats.derivation_index as usize * 100) {
-            let res = self.derive_addresses();
-            if res.is_err() {
-                error!("Error deriving addresses: {res:?}");
-            }
+            self.derive_addresses()?;
         }
+        Ok(())
     }
 
     fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError<D::Error>> {
@@ -388,27 +402,35 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         Ok(unconfirmed)
     }
 
-    fn find_spend(&self, transaction: &Transaction) -> Vec<(usize, TxOut)> {
+    fn find_spend(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Vec<(usize, TxOut)>, WatchOnlyError<D::Error>> {
         let mut spends = Vec::new();
         for (idx, input) in transaction.input.iter().enumerate() {
             if self.utxo_index.contains_key(&input.previous_output) {
-                let prev_tx = self.get_transaction(&input.previous_output.txid).unwrap();
+                let prev_tx = self
+                    .get_transaction(&input.previous_output.txid)
+                    .ok_or(WatchOnlyError::TransactionNotFound)?;
                 spends.push((
                     idx,
                     prev_tx.tx.output[input.previous_output.vout as usize].clone(),
                 ));
             }
         }
-        spends
+        Ok(spends)
     }
 
-    fn cache_mempool_transaction(&mut self, transaction: &Transaction) -> Vec<TxOut> {
-        let mut coins = self.find_spend(transaction);
+    fn cache_mempool_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<Vec<TxOut>, WatchOnlyError<D::Error>> {
+        let mut coins = self.find_spend(transaction)?;
         for (idx, spend) in coins.iter() {
             let script = self
                 .address_map
                 .get(&get_spk_hash(&spend.script_pubkey))
-                .unwrap()
+                .ok_or(WatchOnlyError::CachedAddressNotFound)?
                 .to_owned();
             self.cache_transaction(
                 transaction,
@@ -419,12 +441,16 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                 *idx,
                 true,
                 script.script_hash,
-            )
+            )?;
         }
         for (idx, out) in transaction.output.iter().enumerate() {
             let spk_hash = get_spk_hash(&out.script_pubkey);
             if self.script_set.contains(&spk_hash) {
-                let script = self.address_map.get(&spk_hash).unwrap().to_owned();
+                let script = self
+                    .address_map
+                    .get(&spk_hash)
+                    .ok_or(WatchOnlyError::CachedAddressNotFound)?
+                    .to_owned();
                 coins.push((idx, out.clone()));
                 self.cache_transaction(
                     transaction,
@@ -435,23 +461,28 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                     idx,
                     true,
                     script.script_hash,
-                )
+                )?;
             }
         }
-        coins
+        Ok(coins
             .iter()
             .cloned()
             .unzip::<usize, TxOut, Vec<usize>, Vec<TxOut>>()
-            .1
+            .1)
     }
 
-    fn save_mempool_tx(&mut self, hash: Hash, transaction_to_cache: CachedTransaction) {
+    fn save_mempool_tx(
+        &mut self,
+        hash: Hash,
+        transaction_to_cache: CachedTransaction,
+    ) -> Result<(), WatchOnlyError<D::Error>> {
         if let Some(address) = self.address_map.get_mut(&hash) {
             if !address.transactions.contains(&transaction_to_cache.hash) {
                 address.transactions.push(transaction_to_cache.hash);
-                self.database.update(address);
+                self.database.update(address)?;
             }
         }
+        Ok(())
     }
 
     fn save_non_mempool_tx(
@@ -462,7 +493,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         index: usize,
         hash: Hash,
         transaction_to_cache: CachedTransaction,
-    ) {
+    ) -> Result<(), WatchOnlyError<D::Error>> {
         if let Some(address) = self.address_map.get_mut(&hash) {
             // This transaction is spending from this address, so we should remove the UTXO
             if is_spend {
@@ -471,7 +502,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                 let input = transaction
                     .input
                     .get(index)
-                    .expect("Malformed call, index is bigger than the output vector");
+                    .ok_or(WatchOnlyError::IndexOutOfBounds)?;
                 let idx = address
                     .utxos
                     .iter()
@@ -493,9 +524,10 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
 
             if !address.transactions.contains(&transaction_to_cache.hash) {
                 address.transactions.push(transaction_to_cache.hash);
-                self.database.update(address);
+                self.database.update(address)?;
             }
         }
+        Ok(())
     }
 
     /// Caches a new transaction. This method may be called for addresses we don't follow yet,
@@ -511,7 +543,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         index: usize,
         is_spend: bool,
         hash: sha256::Hash,
-    ) {
+    ) -> Result<(), WatchOnlyError<D::Error>> {
         let transaction_to_cache = CachedTransaction {
             height,
             merkle_block: Some(merkle_block),
@@ -519,9 +551,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             hash: transaction.compute_txid(),
             position,
         };
-        self.database
-            .save_transaction(&transaction_to_cache)
-            .expect("Database not working");
+        self.database.save_transaction(&transaction_to_cache)?;
 
         if let Entry::Vacant(e) = self.address_map.entry(hash) {
             let script = transaction.output[index].script_pubkey.clone();
@@ -536,12 +566,12 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
                 transactions: Vec::new(),
                 utxos: Vec::new(),
             };
-            self.database.save(&new_address);
+            self.database.save(&new_address)?;
 
             e.insert(new_address);
             self.script_set.insert(hash);
         }
-        self.maybe_derive_addresses();
+        self.maybe_derive_addresses()?;
         // Confirmed transaction
         if height > 0 {
             return self.save_non_mempool_tx(
@@ -554,7 +584,7 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             );
         }
         // Unconfirmed transaction
-        self.save_mempool_tx(hash, transaction_to_cache);
+        self.save_mempool_tx(hash, transaction_to_cache)
     }
 }
 
@@ -575,15 +605,29 @@ impl<D: AddressCacheDatabase + Sync + Send + 'static> BlockConsumer for AddressC
         height: u32,
         _spent_utxos: Option<&HashMap<OutPoint, UtxoData>>,
     ) {
-        self.block_process(block, height);
+        if let Err(e) = self.block_process(block, height) {
+            error!("Error processing block at height {height}: {e}");
+        }
     }
 }
 
 impl<D: AddressCacheDatabase> AddressCache<D> {
-    pub fn new(database: D) -> AddressCache<D> {
-        AddressCache {
-            inner: RwLock::new(AddressCacheInner::new(database)),
-        }
+    pub fn new(database: D) -> Result<AddressCache<D>, WatchOnlyError<D::Error>> {
+        Ok(AddressCache {
+            inner: RwLock::new(AddressCacheInner::new(database)?),
+        })
+    }
+
+    fn read_inner(
+        &self,
+    ) -> Result<sync::RwLockReadGuard<'_, AddressCacheInner<D>>, WatchOnlyError<D::Error>> {
+        self.inner.read().map_err(|_| WatchOnlyError::PoisonedLock)
+    }
+
+    fn write_inner(
+        &self,
+    ) -> Result<sync::RwLockWriteGuard<'_, AddressCacheInner<D>>, WatchOnlyError<D::Error>> {
+        self.inner.write().map_err(|_| WatchOnlyError::PoisonedLock)
     }
 
     pub fn get_utxo(&self, outpoint: &OutPoint) -> Option<TxOut> {
@@ -616,22 +660,19 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
             .collect()
     }
 
-    pub fn bump_height(&self, height: u32) {
-        let inner = self.inner.read().expect("poisoned lock");
-        inner
-            .database
-            .set_cache_height(height)
-            .expect("Database is not working");
+    pub fn bump_height(&self, height: u32) -> Result<(), WatchOnlyError<D::Error>> {
+        let inner = self.read_inner()?;
+        Ok(inner.database.set_cache_height(height)?)
     }
 
-    pub fn get_cache_height(&self) -> u32 {
-        let inner = self.inner.read().expect("poisoned lock");
-        inner.database.get_cache_height().unwrap_or(0)
+    pub fn get_cache_height(&self) -> Result<u32, WatchOnlyError<D::Error>> {
+        let inner = self.read_inner()?;
+        Ok(inner.database.get_cache_height()?)
     }
 
     /// Tells whether or not a descriptor is already cached
     pub fn is_cached(&self, desc: &String) -> Result<bool, WatchOnlyError<D::Error>> {
-        let inner = self.inner.read().expect("poisoned lock");
+        let inner = self.read_inner()?;
         let known_descs = inner.database.descs_get()?;
         Ok(known_descs.contains(desc))
     }
@@ -643,7 +684,7 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
 
     pub fn push_descriptor(&self, descriptor: &str) -> Result<(), WatchOnlyError<D::Error>> {
-        let inner = self.inner.write().expect("poisoned lock");
+        let inner = self.write_inner()?;
         Ok(inner.database.desc_save(descriptor)?)
     }
 
@@ -664,12 +705,16 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
 
     pub fn setup(&self) -> Result<(), WatchOnlyError<D::Error>> {
-        let inner = self.inner.read().expect("poisoned lock");
+        let inner = self.read_inner()?;
         inner.setup()
     }
 
-    pub fn block_process(&self, block: &Block, height: u32) -> Vec<(Transaction, TxOut)> {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    pub fn block_process(
+        &self,
+        block: &Block,
+        height: u32,
+    ) -> Result<Vec<(Transaction, TxOut)>, WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.block_process(block, height)
     }
 
@@ -697,40 +742,47 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
 
     pub fn derive_addresses(&self) -> Result<(), WatchOnlyError<D::Error>> {
-        let mut inner = self.inner.write().expect("poisoned lock");
+        let mut inner = self.write_inner()?;
         inner.derive_addresses()
     }
 
     pub fn get_stats(&self) -> Result<Stats, WatchOnlyError<D::Error>> {
-        let inner = self.inner.read().expect("poisoned lock");
+        let inner = self.read_inner()?;
         inner
             .database
             .get_stats()
             .map_err(WatchOnlyError::DatabaseError)
     }
 
-    pub fn maybe_derive_addresses(&self) {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    pub fn maybe_derive_addresses(&self) -> Result<(), WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.maybe_derive_addresses()
     }
 
     pub fn find_unconfirmed(&self) -> Result<Vec<Transaction>, WatchOnlyError<D::Error>> {
-        let inner = self.inner.read().expect("poisoned lock");
+        let inner = self.read_inner()?;
         inner.find_unconfirmed()
     }
 
-    pub fn cache_address(&self, script_pk: ScriptBuf) {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    pub fn cache_address(&self, script_pk: ScriptBuf) -> Result<(), WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.cache_address(script_pk)
     }
 
-    pub fn cache_mempool_transaction(&self, transaction: &Transaction) -> Vec<TxOut> {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    pub fn cache_mempool_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Vec<TxOut>, WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.cache_mempool_transaction(transaction)
     }
 
-    pub fn save_mempool_tx(&self, hash: Hash, transaction_to_cache: CachedTransaction) {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    pub fn save_mempool_tx(
+        &self,
+        hash: Hash,
+        transaction_to_cache: CachedTransaction,
+    ) -> Result<(), WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.save_mempool_tx(hash, transaction_to_cache)
     }
 
@@ -742,8 +794,8 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         index: usize,
         hash: Hash,
         transaction_to_cache: CachedTransaction,
-    ) {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    ) -> Result<(), WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.save_non_mempool_tx(
             transaction,
             is_spend,
@@ -755,7 +807,7 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
     }
 
     pub fn get_descriptors(&self) -> Result<Vec<String>, WatchOnlyError<D::Error>> {
-        let inner = self.inner.read().expect("poisoned lock");
+        let inner = self.read_inner()?;
         inner
             .database
             .descs_get()
@@ -773,8 +825,8 @@ impl<D: AddressCacheDatabase> AddressCache<D> {
         index: usize,
         is_spend: bool,
         hash: sha256::Hash,
-    ) {
-        let mut inner = self.inner.write().expect("poisoned lock");
+    ) -> Result<(), WatchOnlyError<D::Error>> {
+        let mut inner = self.write_inner()?;
         inner.cache_transaction(
             transaction,
             height,
@@ -803,9 +855,13 @@ mod test {
     use bitcoin::Txid;
     use floresta_common::get_spk_hash;
     use floresta_common::prelude::*;
+    use kv::Config;
+    use kv::Store;
 
     use super::memory_database::MemoryDatabase;
     use super::AddressCache;
+    use super::WatchOnlyError;
+    use crate::kv_database::KvDatabase;
     use crate::merkle::MerkleProof;
 
     const BLOCK_FIRST_UTXO: &str = "00000020b4f594a390823c53557c5a449fa12413cbbae02be529c11c4eb320ff8e000000dd1211eb35ca09dc0ee519b0f79319fae6ed32c66f8bbf353c38513e2132c435474d81633c4b011e195a220002010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0403edce01feffffff028df2052a0100000016001481113cad52683679a83e76f76f84a4cfe36f75010000000000000000776a24aa21a9ed67863b4f356b7b9f3aab7a2037615989ef844a0917fb0a1dcd6c23a383ee346b4c4fecc7daa2490047304402203768ff10a948a2dd1825cc5a3b0d336d819ea68b5711add1390b290bf3b1cba202201d15e73791b2df4c0904fc3f7c7b2f22ab77762958e9bc76c625138ad3a04d290100012000000000000000000000000000000000000000000000000000000000000000000000000002000000000101be07b18750559a418d144f1530be380aa5f28a68a0269d6b2d0e6ff3ff25f3200000000000feffffff0240420f00000000001600142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a326f55d94c060000160014c2ed86a626ee74d854a12c9bb6a9b72a80c0ddc50247304402204c47f6783800831bd2c75f44d8430bf4d962175349dc04d690a617de6c1eaed502200ffe70188a6e5ad89871b2acb4d0f732c2256c7ed641d2934c6e84069c792abc012103ba174d9c66078cf813d0ac54f5b19b5fe75104596bdd6c1731d9436ad8776f41ecce0100";
@@ -818,7 +874,7 @@ mod test {
 
     fn get_test_cache() -> AddressCache<MemoryDatabase> {
         let database = MemoryDatabase::new();
-        AddressCache::new(database)
+        AddressCache::new(database).expect("MemoryDatabase::new should never fail")
     }
 
     fn get_test_address() -> (Address<NetworkChecked>, sha256::Hash) {
@@ -827,6 +883,25 @@ mod test {
             .assume_checked();
         let script_hash = get_spk_hash(&address.script_pubkey());
         (address, script_hash)
+    }
+
+    #[test]
+    fn new_returns_err_when_database_load_fails() {
+        let test_id = rand::random::<u64>();
+        let path = format!("./tmp-db/test-corrupt-{test_id}/");
+        {
+            let cfg = Config::new(&path);
+            let store = Store::new(cfg).unwrap();
+            let bucket = store.bucket::<String, Vec<u8>>(Some("addresses")).unwrap();
+            bucket
+                .set(&"corrupted_entry".to_string(), &vec![0xFF, 0xFE])
+                .unwrap();
+            bucket.flush().unwrap();
+        }
+        let db = KvDatabase::new(path.clone()).unwrap();
+        let result = AddressCache::new(db);
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(matches!(result, Err(WatchOnlyError::DatabaseError(_))));
     }
 
     #[test]
@@ -841,7 +916,7 @@ mod test {
         // Should have no address before caching
         assert_eq!(cache.n_cached_addresses(), 0);
 
-        cache.cache_address(address.script_pubkey());
+        cache.cache_address(address.script_pubkey()).unwrap();
         // Assert we indeed have one cached address
         assert_eq!(cache.n_cached_addresses(), 1);
         assert_eq!(cache.get_address_balance(&script_hash), Some(0));
@@ -863,16 +938,18 @@ mod test {
         let (_, script_hash) = get_test_address();
         let cache = get_test_cache();
 
-        cache.cache_transaction(
-            &transaction,
-            118511,
-            transaction.output[0].value.to_sat(),
-            merkle_block,
-            1,
-            0,
-            false,
-            get_spk_hash(&transaction.output[0].script_pubkey),
-        );
+        cache
+            .cache_transaction(
+                &transaction,
+                118511,
+                transaction.output[0].value.to_sat(),
+                merkle_block,
+                1,
+                0,
+                false,
+                get_spk_hash(&transaction.output[0].script_pubkey),
+            )
+            .unwrap();
 
         assert_eq!(
             script_hash,
@@ -926,16 +1003,18 @@ mod test {
         let transaction = Vec::from_hex(transaction).unwrap();
         let transaction = deserialize(&transaction).unwrap();
 
-        cache.cache_transaction(
-            &transaction,
-            0,
-            transaction.output[1].value.to_sat(),
-            MerkleProof::default(),
-            2,
-            1,
-            false,
-            get_spk_hash(&transaction.output[1].script_pubkey),
-        );
+        cache
+            .cache_transaction(
+                &transaction,
+                0,
+                transaction.output[1].value.to_sat(),
+                MerkleProof::default(),
+                2,
+                1,
+                false,
+                get_spk_hash(&transaction.output[1].script_pubkey),
+            )
+            .unwrap();
 
         assert_eq!(
             cache.find_unconfirmed().unwrap()[0].compute_txid(),
@@ -947,11 +1026,11 @@ mod test {
     fn test_process_block() {
         let (address, script_hash) = get_test_address();
         let cache = get_test_cache();
-        cache.cache_address(address.script_pubkey());
+        cache.cache_address(address.script_pubkey()).unwrap();
 
         let block = "000000203ea734fa2c8dee7d3194878c9eaf6e83a629f79b3076ec857793995e01010000eb99c679c0305a1ac0f5eb2a07a9f080616105e605b92b8c06129a2451899225ab5481633c4b011e0b26720102020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0403efce01feffffff026ef2052a01000000225120a1a1b1376d5165617a50a6d2f59abc984ead8a92df2b25f94b53dbc2151824730000000000000000776a24aa21a9ed1b4c48a7220572ff3ab3d2d1c9231854cb62542fbb1e0a4b21ebbbcde8d652bc4c4fecc7daa2490047304402204b37c41fce11918df010cea4151737868111575df07f7f2945d372e32a6d11dd02201658873a8228d7982df6bdbfff5d0cad1d6f07ee400e2179e8eaad8d115b7ed001000120000000000000000000000000000000000000000000000000000000000000000000000000020000000001017ca523c5e6df0c014e837279ab49be1676a9fe7571c3989aeba1e5d534f4054a0000000000fdffffff01d2410f00000000001600142b6a2924aa9b1b115d1ac3098b0ba0e6ed510f2a02473044022071b8583ba1f10531b68cb5bd269fb0e75714c20c5a8bce49d8a2307d27a082df022069a978dac00dd9d5761aa48c7acc881617fa4d2573476b11685596b17d437595012103b193d06bd0533d053f959b50e3132861527e5a7a49ad59c5e80a265ff6a77605eece0100";
         let block = deserialize(&Vec::from_hex(block).unwrap()).unwrap();
-        cache.block_process(&block, 118511);
+        cache.block_process(&block, 118511).unwrap();
 
         let balance = cache.get_address_balance(&script_hash);
         let history = cache.get_address_history(&script_hash).unwrap();
@@ -975,8 +1054,8 @@ mod test {
         // TESTS FOR SMALL HELPER FUNCTIONS
 
         // [bump_height], [get_cache_height], [set_cache_height]
-        cache.bump_height(118511);
-        assert_eq!(cache.get_cache_height(), 118511);
+        cache.bump_height(118511).unwrap();
+        assert_eq!(cache.get_cache_height().unwrap(), 118511);
 
         // [is_cached], [push_descriptor]
         let desc = "wsh(sortedmulti(1,[54ff5a12/48h/1h/0h/2h]tpubDDw6pwZA3hYxcSN32q7a5ynsKmWr4BbkBNHydHPKkM4BZwUfiK7tQ26h7USm8kA1E2FvCy7f7Er7QXKF8RNptATywydARtzgrxuPDwyYv4x/<0;1>/*,[bcf969c0/48h/1h/0h/2h]tpubDEFdgZdCPgQBTNtGj4h6AehK79Jm4LH54JrYBJjAtHMLEAth7LuY87awx9ZMiCURFzFWhxToRJK6xp39aqeJWrG5nuW3eBnXeMJcvDeDxfp/<0;1>/*))#fuw35j0q";
@@ -998,10 +1077,10 @@ mod test {
         let script_hash = get_spk_hash(&spk);
         let cache = get_test_cache();
 
-        cache.cache_address(spk);
+        cache.cache_address(spk).unwrap();
 
-        cache.block_process(&block1, 118511);
-        cache.block_process(&block2, 118509);
+        cache.block_process(&block1, 118511).unwrap();
+        cache.block_process(&block2, 118509).unwrap();
 
         let address = cache.inner.read().unwrap();
         let address = address.address_map.get(&script_hash).unwrap();
