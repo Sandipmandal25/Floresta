@@ -91,12 +91,16 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             let tx = self
                 .wallet
                 .get_transaction(&tx_id)
+                .ok()
+                .flatten()
                 .ok_or(JsonRpcError::TxNotFound);
             return tx.map(|tx| serde_json::to_value(self.make_raw_transaction(tx)).unwrap());
         }
 
         self.wallet
             .get_transaction(&tx_id)
+            .ok()
+            .flatten()
             .and_then(|tx| serde_json::to_value(self.make_raw_transaction(tx)).ok())
             .ok_or(JsonRpcError::TxNotFound)
     }
@@ -106,7 +110,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         info!("Descriptor pushed: {descriptor}");
         debug!("Rescanning with block filters for addresses: {addresses:?}");
 
-        let addresses = self.wallet.get_cached_addresses();
+        let addresses = self.wallet.get_cached_addresses().unwrap_or_default();
         let wallet = self.wallet.clone();
         if self.block_filter_storage.is_none() {
             return Err(JsonRpcError::InInitialBlockDownload);
@@ -143,7 +147,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             return Err(JsonRpcError::InInitialBlockDownload);
         }
 
-        let addresses = self.wallet.get_cached_addresses();
+        let addresses = self.wallet.get_cached_addresses().unwrap_or_default();
 
         if addresses.is_empty() {
             return Err(JsonRpcError::NoAddressesToRescan);
@@ -594,7 +598,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                     .unwrap()
                     .unwrap();
 
-                wallet.block_process(&block, height);
+                if let Err(e) = wallet.block_process(&block, height) {
+                    error!("Error processing block at height {height}: {e}");
+                }
             }
         }
 
